@@ -1,1 +1,11 @@
+.container {
+  display: flex;
+}
+.left, .right {
+  flex: 1;
+  padding: 10px;
+  border: 1px solid #ccc;
+  height: 80vh;
+  overflow: auto;
+}
 
