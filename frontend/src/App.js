@@ -15,14 +15,14 @@ function App() {
 
   const fetchRepoFiles = async () => {
     const { owner, repo } = extractRepoDetails(repoUrl);
-    const response = await fetch(`http://localhost:8000/repo/tree?owner=${owner}&repo=${repo}`);
+    const response = await fetch(`https://repo-visualizer-1.onrender.com/repo/tree?owner=${owner}&repo=${repo}`);
     const data = await response.json();
     setFiles(data.files);
   };
 
   const fetchFileContent = async (path) => {
     const { owner, repo } = extractRepoDetails(repoUrl);
-    const response = await fetch(`http://localhost:8000/repo/file?owner=${owner}&repo=${repo}&file_path=${path}`);
+    const response = await fetch(`https://repo-visualizer-1.onrender.com/repo/file?owner=${owner}&repo=${repo}&file_path=${path}`);
     const data = await response.json();
     setSelectedContent(data.content);
   };
