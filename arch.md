@@ -80,6 +80,8 @@ flowchart TB
     SENSOR --- ALARM
     SENSOR --- log
 ```
+- We are using the *Coordinated Controller Pattern*
+- Assumption: Timestamp for both AoA sensor Frame and Flight Parameter Frame will always same.
 
 ---
 
