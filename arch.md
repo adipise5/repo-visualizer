@@ -32,82 +32,53 @@ Preliminary software block decomposition derived from the project spec, UART fra
 **System state is owned by:** `FlightControlFSM` (flight phase + control authority level)
 
 ```mermaid
-flowchart TD
-    TOP["AoA_Controller_Top
-    Responsibility: Sequenced initialization and periodic tick dispatch
-    State: boot_status
-    Interface: system_init(), system_tick()
-    Owner: TBD"]
+---
+config:
+  layout: elk
+---
+flowchart TB
 
-    UART["UART_FrameParser
-    Responsibility: Parse independent async UART frames (AoA, FlightParams, FlightMode)
-    State: rx_buffer, frame_status[3], last_rx_ts[3]
-    Interface: get_aoa(sensor_id), get_airspeed(), get_mode(), get_frame_status(id)
-    Owner: TBD"]
+    MAIN["MAIN"]
 
-    CONFIG["AircraftConfig
-    Responsibility: Load and expose aircraft type (A or B) -- read-only after init
-    State: aircraft_type
-    Interface: config_init(), get_config()
-    Owner: TBD"]
+    AoA["AoAControl"]
+    Input["UART Input"]
+    SENSOR["FlightControl"]
+    override["OverrideControl"]
+    ALARM["AlarmSystem"]
+    log["Logging"]
 
-    SENSOR["SensorValidator
-    Responsibility: Detect disagreement, staleness, and failure between S1 and S2
-    State: sensor_state, disagree_timer
-    Interface: sensor_tick(), get_sensor_state(), get_voted_aoa()
-    Owner: TBD"]
+    validator["SensorValidator"]
+    estimator["AoA_Estimator"]
 
-    ESTIMATOR["AoA_Estimator
-    Responsibility: Produce AoA_EFFECTIVE or mark UNKNOWN based on sensor state
-    State: aoa_effective, aoa_status
-    Interface: estimate_tick(), get_aoa_effective(), get_aoa_status()
-    Owner: TBD"]
+    AoASensor["AoA_Sensor_Frames"]
+    parameter["Flight Parameter Frames"]
+    mode["Flight Mode Frames"]
+    config["Aircraft Configuration"]
+    MAIN --- AoA
+    MAIN --- Input
+    MAIN --- SENSOR
+    MAIN --- override
+    MAIN --- ALARM
+    MAIN --- log
+    AoA --- validator
+    AoA --- estimator
+    Input --- AoASensor
+    Input --- parameter
+    Input --- mode
+    Input --- config
+    AoASensor --- validator
+    AoASensor --- log
 
-    FSM["FlightControlFSM
-    Responsibility: Evaluate AoA vs envelope; manage authority level
-    State: flight_phase, control_level
-    Interface: fsm_tick(), get_control_level(), get_flight_phase()
-    Owner: TBD"]
+    parameter --- SENSOR
+    mode --- SENSOR
+    config --- SENSOR
 
-    ELEV["ElevatorCmdManager
-    Responsibility: Generate elevator deflection commands under protection
-    State: last_cmd, cmd_enabled
-    Interface: apply_cmd(level, config)
-    Owner: TBD"]
+    validator --- estimator
+    estimator --- SENSOR
 
-    WARN["WarningManager
-    Responsibility: Issue alerts to pilot and autopilot; manage response timer
-    State: alert_active, alert_type, response_timer
-    Interface: raise_alert(type), clear_alert(), is_pilot_response_timeout()
-    Owner: TBD"]
-
-    LOGGER["FaultLogger
-    Responsibility: Record all safety events and faults for maintenance traceability
-    State: log_buffer, log_count, overflow_flag
-    Interface: log_event(type, data), flush()
-    Owner: TBD"]
-
-    TOP --> UART
-    TOP --> CONFIG
-    TOP --> SENSOR
-    TOP --> ESTIMATOR
-    TOP --> FSM
-    TOP --> ELEV
-    TOP --> WARN
-    TOP --> LOGGER
-
-    UART --> SENSOR
-    UART --> FSM
-    CONFIG --> FSM
-    CONFIG --> ELEV
-    SENSOR --> ESTIMATOR
-    ESTIMATOR --> FSM
-    FSM --> ELEV
-    FSM --> WARN
-    SENSOR --> LOGGER
-    FSM --> LOGGER
-    ELEV --> LOGGER
-    WARN --> LOGGER
+    SENSOR --- override
+    SENSOR --- ALARM
+    SENSOR --- log
 ```
 
 ---
