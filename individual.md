@@ -437,16 +437,16 @@ Define and document an explicit tie-breaking rule now (e.g., when scores are equ
 
 ## Submission Checklist
 
-- [] Exploratory block sketch included
-- [ ] Architectural rationale provided
-- [ ] Hierarchical control diagram complete
-- [ ] Dependency constraints defined
-- [ ] Behavioral mapping table complete
-- [ ] Interaction summary table complete
-- [ ] Task split defined
-- [ ] Individual module specifications complete
-- [ ] Hierarchy diagram updated
-- [ ] Architectural risk identified
+- [x] Exploratory block sketch included
+- [x] Architectural rationale provided
+- [x] Hierarchical control diagram complete
+- [x] Dependency constraints defined
+- [x] Behavioral mapping table complete
+- [x] Interaction summary table complete
+- [x] Task split defined
+- [x] Individual module specifications complete
+- [x] Hierarchy diagram updated
+- [x] Architectural risk identified
 
 ---
 
