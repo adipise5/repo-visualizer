@@ -28,7 +28,6 @@ Preliminary software block decomposition derived from the project spec, UART fra
 
 ## Step 2 – Hierarchy of Control Diagram
 
-**System control authority resides in:** `FlightControlFSM`
 **System state is owned by:** `FlightControlFSM` (flight phase + control authority level)
 
 ```mermaid
