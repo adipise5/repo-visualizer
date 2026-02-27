@@ -1,0 +1,498 @@
+You are a senior full-stack AI engineer. Build a complete, production-ready,
+locally-hosted legal intelligence system called the
+"Gujarat Police Case Intelligence & Strategy Engine".
+
+
+SECTION 1 — PROJECT PURPOSE
+
+
+This system helps Gujarat Police Investigation Officers (IOs) by:
+
+1. Ingesting past legal documents (FIRs, Panchnamas, Chargesheets, Judgments)
+   in any format — typed PDF, scanned image, handwritten Gujarati, handwritten
+   English — and extracting structured knowledge from them.
+
+2. Building a Knowledge Graph (KG) of cases, evidence patterns, investigation
+   failures, and legal outcomes that is 100% derived from the ingested documents.
+   NO hardcoded legal rules. NO synthetic data. Every insight must trace back
+   to a real ingested document.
+
+3. Connecting the KG to a Vector Knowledge Base (KB) via explicit pointer IDs
+   stored on every KG node, so queries follow:
+       Natural Language Query
+         → KG search (Neo4j Cypher)
+         → collect kb_paragraph_ids from matching KG nodes
+         → ChromaDB.get_by_ids(kb_paragraph_ids)   ← DIRECT pointer fetch
+         → return actual judgment/FIR paragraphs
+   Semantic vector search is a FALLBACK only when KG pointers are empty.
+
+4. Answering IO queries like:
+   "Husband murder of wife, common intention with friends, weapon recovery"
+   and returning:
+   - Conviction probability (from real KG statistics only, not LLM opinion)
+   - Strategic checklist of investigation points (from ingested cases only)
+   - Success/Failure analysis (what worked vs. what caused acquittals)
+   - Linked judgment paragraphs as citations (via KG→KB pointers)
+   - Similar cases with links back to their source documents
+
+5. Cross-linking related documents:
+   FIR → Panchnama → Chargesheet → Judgment for the same case number.
+
+DATA TRANSPARENCY RULE (NON-NEGOTIABLE):
+  Every checklist item, citation, and failure pattern MUST show:
+    - which case it came from (case_number)
+    - the source filename (source_file)
+    - the paragraph reference (para_ref)
+  If an insight cannot be traced to an ingested document, it must NOT appear.
+  The system must NEVER hallucinate case references or statistics.
+
+
+SECTION 2 — TECHNICAL STACK (ALL LOCAL, ZERO CLOUD)
+
+INFERENCE ENGINE:
+  - Ollama serving local LLMs
+  - Default model: llama3.2:3b (fast, ~2GB, works on CPU)
+  - Gujarati text: sarvam/sarvam-1 if available, else llama3.2:3b
+  - LLM used ONLY for extraction (parse entities from raw text)
+  - ZERO LLM calls for synthesis/analysis — all statistics are pure math
+
+KNOWLEDGE GRAPH: Neo4j 5.18 Community Edition
+  Nodes: Case, InvestigativePoint, Failure, Triple, Document
+  Every node stores kb_paragraph_ids: list[str] — ChromaDB IDs (the bridge)
+  Relationships:
+    (Case)-[:HAS_POINT {admitted:bool, doc_type:str}]->(InvestigativePoint)
+    (Case)-[:HAD_FAILURE]->(Failure)
+    (Case)-[:HAS_TRIPLE {doc_type:str}]->(Triple)
+    (Case)-[:HAS_DOCUMENT {doc_type:str}]->(Document)
+    (Case)-[:LINKED_CASE {link_type:str}]->(Case)   ← cross-case links
+
+VECTOR KNOWLEDGE BASE: ChromaDB 0.5.3
+  IMPORTANT: v0.5.3 has NO token auth module. Use plain HttpClient, no auth.
+  Set ANONYMIZED_TELEMETRY=false to silence telemetry errors.
+  Collections: judgment_paragraphs, fir_documents
+  Embedding: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+    (420MB, supports Gujarati+English+50 langs, runs on CPU)
+  Each paragraph metadata: case_number, title, court, year, doc_type, outcome,
+    paragraph_ref, relevance_tag, source_file, is_handwritten
+
+BACKEND: FastAPI + Python 3.11 + LangGraph + async Neo4j
+FRONTEND: Single HTML file, React 18 + Babel CDN (NO npm/build step)
+OCR: pdfplumber + PyMuPDF + Tesseract (guj+eng) with handwriting preprocessing
+
+DEPLOYMENT: Docker Compose, cross-platform (Windows/macOS/Linux)
+
+
+SECTION 3 — DOCUMENT TYPES AND AUTO-CLASSIFICATION
+
+Support FOUR document types with auto-detection:
+
+FIR (First Information Report):
+  Keywords: "First Information Report", "FIR No.", "complainant", "station house"
+  Outcome: always "Pending"
+  Triples: Evidence → ALLEGED_IN_FIR → FIR_{case_number}
+
+PANCHNAMA (Seizure/Recovery Memo):
+  Keywords: "panchnama", "panch witness", "seized", "articles", "recovery memo"
+  Critical failures: detect "no independent witness", "delay in seizure"
+  Triples: Item → RECOVERED_FROM → Location, Item → WITNESSED_BY → Person
+
+CHARGESHEET:
+  Keywords: "charge sheet", "investigation completed", "sections applied"
+  Triples: Accused → CHARGED_UNDER → IPC_Section
+
+JUDGMENT:
+  Keywords: "IN THE COURT", "Sessions Court", "conviction", "acquittal", "sentence"
+  Richest doc type — creates InvestigativePoint and Failure nodes
+  Triples: Evidence → ACCEPTED_BY_JUDGE / REJECTED_BY_JUDGE → Outcome
+
+AUTO-CLASSIFY LOGIC:
+  1. Keyword heuristic (score each type, pick highest if score >= 2)
+  2. LLM fallback if all scores < 2
+  3. Default to "judgment" if LLM also fails
+
+AUTO-GENERATE TRIPLES FALLBACK:
+  If LLM returns 0 triples, auto-generate from evidence_points:
+    FIR:         ep.type → ALLEGED_IN_FIR         → FIR_{case_number}
+    Panchnama:   ep.type → RECOVERED_DURING        → PANCHNAMA_{case_number}
+    Chargesheet: ep.type → CHARGED_AS_EVIDENCE     → {crime_type}
+    Judgment:    ep.type → ACCEPTED/REJECTED_JUDGE → {outcome}
+  Plus for each IPC section: crime_type → CHARGED_UNDER → IPC_{section}
+  This guarantees triples > 0 for every successfully ingested document.
+
+CROSS-DOCUMENT LINKING (after ingest):
+  MATCH (a:Case), (b:Case)
+  WHERE a.case_number = b.case_number AND a.doc_type <> b.doc_type
+  MERGE (a)-[:LINKED_CASE {link_type: a.doc_type+'_to_'+b.doc_type}]->(b)
+
+
+
+SECTION 4 — KG ↔ KB POINTER SYSTEM (THE CORE)
+
+
+INGESTION PIPELINE:
+  Step 1: Extract text (PDF/DOCX/Image/Handwritten — see OCR section)
+  Step 2: Auto-classify doc_type from content
+  Step 3: Run bilingual extractor with doc-type-specific prompt
+  Step 4: Split text into paragraphs (split on \n\n, min 60 chars)
+  Step 5: Tag each paragraph with relevance_tag:
+    acquittal_reasoning | conviction_reasoning | evidence | witness |
+    common_intention | fir_quality | fir_complaint | fir_accused |
+    panchnama_general | charges | harassment | general
+  Step 6: ChromaDB.add_batch(paragraphs, metadatas) → returns list of sha256 IDs
+  Step 7: entities["_kb_paragraph_ids"] = those IDs   ← THE BRIDGE
+  Step 8: kg.ingest_case(entities) stores kb_ids on:
+      Case.kb_paragraph_ids     = all paragraph IDs
+      InvestigativePoint.kb_ids = subset relevant to this point
+      Failure.kb_ids            = subset (judgment criticism paragraphs)
+      Triple.kb_ids             = first 2 IDs
+
+QUERY PIPELINE (KG→KB pointer retrieval):
+  parse_query (LLM, short prompt, 200 tokens)
+  → kg_trace (Cypher — ALL queries MUST return kb_ids column)
+  → collect all_kb_ids from every matching KG node
+  → kb_fetch:
+      PRIMARY:   ChromaDB.get(ids=all_kb_ids)   ← exact pointer, no embedding
+      SECONDARY: ChromaDB.query(embedding)       ← if pointers empty
+      TERTIARY:  ChromaDB.get(limit=20)          ← last resort
+  → synthesize (pure math, ZERO LLM calls)
+
+EVERY CYPHER QUERY MUST RETURN kb_ids:
+  MATCH (c:Case)-[:HAS_POINT]->(ip:InvestigativePoint)
+  ...
+  RETURN ip.name, ip.ipc_section, ip.kb_ids, conv_pct, case_refs
+
+
+SECTION 5 — OCR PIPELINE (HANDWRITING SUPPORT)
+
+
+DETECTION:
+  Digital PDF:      pdfplumber extracts > 80 chars/page avg → use as-is
+  Scanned PDF:      pdfplumber extracts < 80 chars/page → convert to images via PyMuPDF at 300 DPI
+  Image file:       Always use OCR pipeline
+  DOCX:             python-docx text extraction
+
+HANDWRITING PREPROCESSING PIPELINE:
+  1. Convert to grayscale
+  2. Upscale to minimum 1800px width (handwriting needs high resolution)
+  3. MedianFilter(size=3) for denoising
+  4. autocontrast(cutoff=2) for ink normalization
+  5. Otsu binarization threshold (compute via numpy histogram)
+  6. Multi-attempt OCR in order:
+     a. pytesseract lang=guj+eng config="--psm 6 --oem 1"  (handwriting mode)
+     b. pytesseract lang=guj     config="--psm 6 --oem 1"
+     c. pytesseract lang=guj+eng config="--psm 3 --oem 3"  (printed mode)
+     d. pytesseract lang=eng     config="--psm 3 --oem 3"
+  Accept first result with len(text.strip()) > 50
+
+SUPPORTED INPUTS:
+  ✓ Digital PDF (Gujarati or English text)
+  ✓ Scanned PDF (printed)
+  ✓ Scanned PDF (handwritten Gujarati or English)
+  ✓ Image files: PNG, JPG, JPEG, TIFF, BMP, WEBP
+  ✓ DOCX / DOC
+  ✓ Plain text / TXT
+  ✓ Mixed content (printed + handwritten in same document)
+
+TESSERACT MUST BE INSTALLED IN DOCKER:
+  apt-get install -y tesseract-ocr tesseract-ocr-guj tesseract-ocr-eng
+
+
+SECTION 6 — SYNTHESIS RULES (ZERO LLM, PURE MATH)
+
+
+CONVICTION PROBABILITY:
+  if investigation_points from KG:
+    total_weight = sum(p.total_cases for p in points)
+    prob = sum(p.conviction_rate * p.total_cases for p in points) / total_weight
+  elif similar_cases from KG:
+    prob = 100 * (convictions + 0.5*partial) / total_cases
+  else: prob = 50.0
+
+CONFIDENCE: "high" if ≥10 cases, "medium" if ≥3, "low" otherwise
+
+CHECKLIST (from KG nodes only, no LLM):
+  - Source: InvestigativePoint nodes linked to matching cases
+  - conviction_rate_pct = KG aggregate statistic
+  - risk_if_missing = matched Failure node description
+  - mandatory = True if conviction_rate < 70% OR matched_failure exists
+  - case_refs = real case_numbers from KG case_refs property
+  - judgment_excerpts = paragraphs from ChromaDB via kb_ids pointer
+
+FAILURE ANALYSIS (from KG nodes only):
+  - Success factors: InvestigativePoint nodes with conviction_rate >= 60%
+  - Failure factors: Failure nodes from Acquittal/Partial_Conviction cases
+  - All case references include source_file for document accessibility
+
+SECTION 7 — EXACT REQUIREMENTS.TXT (DO NOT CHANGE VERSIONS)
+
+# These exact versions are required — do not change them.
+# langchain-neo4j 0.1.0 requires langchain-community >= 0.3.3
+# (common mistake: pinning community to 0.2.x causes build failure)
+
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+python-multipart==0.0.9
+langchain==0.3.7
+langchain-community==0.3.7
+langchain-core==0.3.15
+langgraph==0.2.28
+langchain-ollama==0.2.0
+neo4j==5.20.0
+langchain-neo4j==0.1.0
+chromadb==0.5.3
+langchain-chroma==0.1.4
+sentence-transformers==3.0.0
+pdfplumber==0.11.0
+python-docx==1.1.2
+pytesseract==0.3.10
+Pillow==10.3.0
+PyMuPDF==1.24.3
+pydantic==2.7.0
+pydantic-settings==2.3.0
+cryptography==42.0.7
+httpx==0.27.0
+tenacity==8.3.0
+structlog==24.2.0
+python-dotenv==1.0.1
+numpy==1.26.4
+
+SECTION 8 — DOCKER COMPOSE (CROSS-PLATFORM)
+
+6 services: neo4j, chromadb, ollama, ollama_init, backend, frontend, schema_init
+All volumes: bind-mounted to ./volumes/ (works on Windows/macOS/Linux)
+No absolute paths anywhere.
+
+CRITICAL service configs:
+  chromadb: set ANONYMIZED_TELEMETRY=false and CHROMA_TELEMETRY=false
+  frontend Dockerfile: FROM nginx:alpine; COPY index.html; COPY nginx.conf
+    (NO npm, NO node_modules — it's a single HTML file)
+  backend Dockerfile: install tesseract-ocr-guj; run as non-root user
+  neo4j healthcheck: start_period=30s (it's slow to start)
+  ollama_init: pulls llama3.2:3b after ollama is ready
+
+setup.sh must:
+  1. Detect OS (Linux/macOS/Windows-WSL)
+  2. Check Docker running
+  3. Generate .env with auto Fernet key
+  4. Create ./volumes/ subdirectories
+  5. Start services and pull models
+  6. Print access URLs: localhost:3000 (UI), :8000/docs (API), :7474 (Neo4j)
+
+.env.example key vars:
+  NEO4J_PASSWORD=ChangeMeSecure123!
+  OLLAMA_EXTRACTION_MODEL=llama3.2:3b
+  OLLAMA_REASONING_MODEL=llama3.2:3b
+  EMBEDDING_MODEL=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+  ANONYMIZED_TELEMETRY=false
+  MAX_KG_RESULTS=15
+  TOP_K_SIMILAR_CASES=5
+  MAX_KB_RESULTS=10
+
+SECTION 9 — API ENDPOINTS
+
+
+POST /api/v1/ingest/document
+  Input:  multipart file + doc_type (default "auto")
+  Output: {status, case_number, doc_type (auto-classified), outcome,
+           crime_type, paragraphs_indexed, kb_ids_stored,
+           triples_created, evidence_points, is_handwritten}
+
+GET  /api/v1/ingest/status
+  Output: {total_cases, convictions, acquittals, pending,
+           judgment_paragraphs_indexed, fir_documents_indexed,
+           cases_by_doc_type: {fir, panchnama, chargesheet, judgment}}
+
+POST /api/v1/analysis/full-intelligence
+  Input:  {query: str, case_context?: dict}
+  Output: {trace_id, parsed_filters, synthesis, checklist, failure_report,
+           similar_cases, semantic_citations, duration_seconds}
+
+GET  /api/v1/analysis/kg-debug
+  Output: all Neo4j cases/points/failures + ChromaDB paragraph counts
+  Use for transparency: verify data is ingested correctly
+
+GET  /api/v1/cases/{case_number}/chain
+  Output: full document chain: {fir, panchnama, chargesheet, judgment}
+  Each entry shows: case_number, source_file, doc_type, outcome, kb_ids
+
+SECTION 10 — FRONTEND REQUIREMENTS
+
+Single index.html, React 18 + Babel CDN. NO build step needed.
+
+UPLOAD PANEL:
+  Supports: .pdf .docx .txt .png .jpg .jpeg .tiff .bmp
+  Shows after upload: doc_type (auto-detected), is_handwritten badge,
+  triples_created count, kb_ids_stored count
+  Doc type selector: auto | fir | panchnama | chargesheet | judgment
+
+QUERY INPUT:
+  Textarea with Ctrl+Enter submit
+  3 example queries for quick testing
+  Show parsed crime_type after query runs
+
+4 RESULT TABS:
+  1. "📋 Checklist" — table:
+     ★ | Point | IPC | Stage | Conv% | Risk | Risk-if-Missing | Cases (4-5 refs)
+     Each case ref shows: title, year, outcome badge, 📎 source_file link
+     Expandable judgment excerpts (click to show ChromaDB paragraph)
+     ★ = mandatory flag
+
+  2. "⚡ Success/Failure Analysis":
+     Filter buttons: All | ✅ Successes | ❌ Failures
+     Each card shows: factor_id (S001/F001), title, description,
+     case examples with 📎 links, judgment excerpts,
+     judge criticism quote (for failures), remediation steps
+     Success factor: green left border
+     Failure factor: red left border
+
+  3. "📄 Citations":
+     Each card shows: rank, case_title, court, year, para_ref,
+     full paragraph text, relevance_tag badge, outcome badge,
+     retrieval_mode badge (kg_pointer = green, semantic = yellow, fallback = gray)
+     📎 source_file link
+
+  4. "⚖️ Similar Cases":
+     Table: Case | Court | Year | Outcome | Key Finding | Source | Doc Chain
+     Doc Chain column: shows chain icons if FIR+Judgment both exist
+     📎 source_file link on every row
+
+SYSTEM STATUS (top right):
+  "X cases · Y paragraphs" refreshed after every upload
+
+DESIGN:
+  --navy: #0a1628, --gold: #c8a84b, dark theme
+  No external CSS frameworks
+  Conviction meter: animated bar, color-coded (green ≥70%, orange ≥45%, red <45%)
+
+SECTION 11 — CRITICAL BUGS TO AVOID
+
+
+1. safe_json() MUST always return dict:
+   If parsed result is list: return {"items": parsed_list}
+   Prevents "list.setdefault" AttributeError crash.
+
+2. ChromaDB 0.5.3 has NO token auth:
+   chromadb.HttpClient(host=..., port=...)  — no auth params at all
+
+3. langchain-community version conflict:
+   langchain-neo4j==0.1.0 requires langchain-community>=0.3.3
+   Never pin community==0.2.x with neo4j==0.1.0
+
+4. Ollama CPU timeouts:
+   llama3.2:3b takes 1-3 min/chunk on MacBook Air (no GPU)
+   Set ALL httpx timeouts to 300 seconds minimum
+   Chunk text to max 3000 chars (not 6000)
+
+5. Frontend Dockerfile: must NOT run npm:
+   FROM nginx:alpine
+   COPY index.html /usr/share/nginx/html/index.html
+   COPY nginx.conf /etc/nginx/conf.d/default.conf
+
+6. ChromaDB get_by_ids with missing IDs:
+   Wrap in try/except — throws exception, does not return null
+
+7. FIR triples = 0:
+   FIRs have no court outcome so LLM returns 0 triples.
+   Always auto-generate from evidence_points as fallback.
+
+8. Windows compatibility:
+   Use relative paths ./volumes/... everywhere
+   Never use /home/user/... absolute paths
+
+9. Neo4j variable name collision in LangGraph:
+   Never use 'f' as variable name (shadows Python filter builtin)
+   Use 'fp' for failure_pattern, 'pf' for parsed_filters
+
+10. Ollama model name:
+    Use llama3.2:3b NOT llama3:8b as default (4x faster on CPU)
+
+SECTION 12 — DEMO DATA (schema_init.py)
+
+Seed 3 complete case chains so the system works immediately:
+
+Case 1: DEMO-2019-GUJ-001 (Conviction)
+  crime_type=Murder, outcome=Conviction, year=2019
+  InvestigativePoints: Weapon_Recovery, Independent_Witness, Common_Intention
+    each with conviction_rate based on 1 case
+
+Case 2: DEMO-2021-GUJ-002 (Acquittal)
+  crime_type=Murder, outcome=Acquittal, year=2021
+  Failures: Delayed_Recovery, No_Independent_Witness
+
+Case 3: DEMO-2020-GUJ-003 (Partial_Conviction)
+  crime_type=Murder, outcome=Partial_Conviction, year=2020
+  InvestigativePoints: Medical_Evidence, Eyewitness_Testimony
+  Failures: No_Premeditation_Evidence
+
+Also seed 5 ChromaDB paragraphs with real legal language.
+Store their IDs in the Case nodes' kb_paragraph_ids property.
+This makes the system return real data immediately after docker compose up.
+
+SECTION 13 — FILE STRUCTURE (generate all 22 files)
+
+gujarat-police-ai/
+├── docker-compose.yml
+├── .env.example
+├── .gitignore
+├── setup.sh
+├── README.md
+├── backend/
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   ├── main.py
+│   ├── config.py
+│   ├── modules/
+│   │   ├── ollama_client.py        (safe_json always dict)
+│   │   ├── kb_client.py            (get_by_ids primary, search fallback)
+│   │   ├── kg_client.py            (stores kb_ids on all nodes)
+│   │   ├── bilingual_extractor.py  (auto-classify + 4 doc-type prompts)
+│   │   ├── hybrid_query_controller.py (KG→KB pointer pipeline)
+│   │   ├── checklist_generator.py  (pure math, from KG only)
+│   │   ├── failure_analysis.py     (success+failure, from KG only)
+│   │   └── encryption.py
+│   ├── api/
+│   │   ├── routes_ingestion.py
+│   │   ├── routes_query.py
+│   │   └── routes_analysis.py      (kg-debug + case chain endpoints)
+│   └── ingestion/
+│       ├── document_ingester.py    (OCR + KG↔KB wiring)
+│       └── schema_init.py          (schema + demo data)
+├── frontend/
+│   ├── Dockerfile
+│   ├── nginx.conf
+│   └── index.html                  (complete React SPA)
+└── cypher/
+    └── init_schema.cypher
+
+
+SECTION 14 — ACCEPTANCE CRITERIA
+
+
+After setup.sh completes:
+✅ http://localhost:3000 shows the Gujarat Police Intelligence Engine UI
+✅ Upload FIR PDF → response shows doc_type="fir", triples > 0
+✅ Upload handwritten Gujarati image → is_handwritten=true, text extracted
+✅ Query "Murder husband common intention" → checklist has items from demo data
+✅ Each checklist item shows case_number and source_file
+✅ Citations tab shows retrieval_mode: "kg_pointer" (not just semantic)
+✅ Failure analysis shows ✅ and ❌ sections with real case refs
+✅ Cases tab shows 📎 source_file links
+✅ /api/v1/analysis/kg-debug shows kb_paragraph_ids populated on Case nodes
+✅ docker compose ps shows all 5 services as "healthy" or "running"
+✅ Runs on: macOS Apple Silicon, macOS Intel, Linux x86_64, Windows WSL2
+
+
+OUTPUT INSTRUCTIONS
+
+
+Generate ALL 22 files with complete, runnable code.
+No placeholder comments. Every function fully implemented.
+Generate in this order:
+  1. docker-compose.yml    2. .env.example       3. setup.sh
+  4. requirements.txt      5. backend/Dockerfile  6. config.py
+  7. ollama_client.py      8. kb_client.py        9. kg_client.py
+  10. bilingual_extractor.py  11. document_ingester.py
+  12. hybrid_query_controller.py  13. checklist_generator.py
+  14. failure_analysis.py  15. routes_ingestion.py  16. routes_analysis.py
+  17. main.py              18. schema_init.py     19. frontend/Dockerfile
+  20. nginx.conf           21. index.html         22. README.md
